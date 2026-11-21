@@ -2034,6 +2034,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_fill(params, tensor);
             } break;
+        case GGML_OP_INKLING:
+            {
+                ggml_compute_forward_inkling(params, tensor);
+            } break;
         case GGML_OP_SLEEP:
             {
                 ggml_compute_forward_sleep(params, tensor);
@@ -2281,6 +2285,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_FILL:
+        case GGML_OP_INKLING:
             {
                 n_tasks = n_threads;
             } break;

@@ -73,6 +73,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/inkling.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
@@ -3153,6 +3154,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_INKLING:
+            ggml_cuda_op_inkling(ctx, dst);
+            break;
         case GGML_OP_SLEEP:
             ggml_cuda_op_sleep(ctx, dst);
             break;
@@ -5310,6 +5314,92 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_OPPROF=1: time every node (or fused group) with CUDA events in eager mode, print a per-op table at exit
+struct ggml_cuda_opprof {
+    struct rec { std::string key; int ev; };
+    bool enabled = getenv("GGML_CUDA_OPPROF") != nullptr;
+    std::vector<cudaEvent_t> events;
+    std::vector<rec> recs;
+    std::map<std::string, std::pair<double, int64_t>> acc;
+    double  span_ms = 0.0;
+    double  busy_ms = 0.0;
+    int64_t n_graphs = 0;
+    int64_t n_kern   = 0;
+
+    cudaEvent_t ev(int i) {
+        while ((int) events.size() <= i) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            events.push_back(e);
+        }
+        return events[i];
+    }
+    static std::string key_of(const ggml_tensor * first, const ggml_tensor * last) {
+        std::string name = first->name;
+        const size_t dash = name.rfind('-');
+        if (dash != std::string::npos) {
+            name = name.substr(0, dash);
+        }
+        if (name.rfind("node_", 0) == 0) {
+            name = "";
+        }
+        const size_t sp = name.find(' ');
+        if (sp != std::string::npos) {
+            name = name.substr(0, sp) + "...";
+        }
+        std::string k = std::string(ggml_op_desc(first));
+        if (first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) {
+            k += std::string("[") + ggml_type_name(first->src[0]->type) + " n=" + std::to_string(first->src[1]->ne[1]) + "]";
+        }
+        if (last != first) {
+            k += std::string(" +fused->") + ggml_op_desc(last);
+        }
+        return k + "  (" + name + ")";
+    }
+    void begin(cudaStream_t st) {
+        recs.clear();
+        CUDA_CHECK(cudaEventRecord(ev(0), st));
+    }
+    void node(cudaStream_t st, const ggml_tensor * first, const ggml_tensor * last) {
+        const int i = (int) recs.size() + 1;
+        recs.push_back({key_of(first, last), i});
+        CUDA_CHECK(cudaEventRecord(ev(i), st));
+    }
+    void end() {
+        if (recs.empty()) {
+            return;
+        }
+        CUDA_CHECK(cudaEventSynchronize(ev((int) recs.size())));
+        float total = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total, ev(0), ev((int) recs.size())));
+        span_ms += total;
+        for (size_t i = 0; i < recs.size(); ++i) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev((int) i), ev((int) i + 1)));
+            auto & a = acc[recs[i].key];
+            a.first  += ms;
+            a.second += 1;
+            busy_ms  += ms;
+        }
+        n_kern += recs.size();
+        n_graphs++;
+    }
+    ~ggml_cuda_opprof() {
+        if (!enabled || n_graphs == 0) {
+            return;
+        }
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(acc.begin(), acc.end());
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
+        fprintf(stderr, "\n=== GGML_CUDA_OPPROF: %lld graphs, %.3f ms GPU span/graph, %.1f nodes/graph ===\n",
+                (long long) n_graphs, span_ms/n_graphs, double(n_kern)/n_graphs);
+        for (size_t i = 0; i < v.size() && i < 60; ++i) {
+            fprintf(stderr, "%8.3f ms/graph %6.1f%%  x%-6.1f %s\n", v[i].second.first/n_graphs, 100.0*v[i].second.first/span_ms,
+                    double(v[i].second.second)/n_graphs, v[i].first.c_str());
+        }
+    }
+};
+static ggml_cuda_opprof g_opprof;
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5415,6 +5505,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            const bool opprof = g_opprof.enabled && !use_cuda_graph;
+            if (opprof) {
+                g_opprof.begin(cuda_ctx->stream());
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -5468,6 +5562,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                if (opprof && nodes_to_skip != 0) {
+                    g_opprof.node(cuda_ctx->stream(), node, cgraph->nodes[i + nodes_to_skip]);
+                }
+
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5501,9 +5599,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (opprof) {
+                    g_opprof.node(cuda_ctx->stream(), node, node);
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (opprof) {
+                g_opprof.end();
             }
         }
 
@@ -6819,6 +6924,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
             return true;
+        case GGML_OP_INKLING:
+            return ggml_cuda_inkling_supported(op);
         case GGML_OP_DIAG:
             return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_SOLVE_TRI:

@@ -396,6 +396,7 @@ extern "C" {
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
+        GGML_OP_INKLING,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -2282,6 +2283,37 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // fused Inkling 2 blocks (GGML_OP_INKLING), op_params[0] selects the sub-op
+    enum ggml_inkling_op {
+        GGML_INKLING_CLIP    = 0, // x = a*scale; x*clamp(t/(|x| + 1e-6), 0, 1) per row
+        GGML_INKLING_MIX     = 1, // softmax over the rms-normed states with learned queries, weighted sum
+        GGML_INKLING_CONTROL = 2, // h = D [rms(cur); rms(msg)] (normed separately); (1 - tanh(F h))*cur + tanh(G h)*msg
+    };
+
+    // a: F32 [ne0, ne1, ne2, ne3] contiguous, scale: NULL or F32 broadcastable to a, the norm is over ne0
+    GGML_API struct ggml_tensor * ggml_inkling_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 threshold);
+
+    // query: F32 [n_embd, n_query], states: n_states (1..9) F32 [n_embd, n_tokens] with contiguous rows
+    // result: F32 [n_embd, n_tokens, n_query], each query's output is contiguous
+    GGML_API struct ggml_tensor * ggml_inkling_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor ** states,
+            int                   n_states);
+
+    // cur, msg: F32 [n_embd, n_tokens]; down: F32 [2*n_embd, rank]; gain, forget: F32 [rank, n_embd]
+    GGML_API struct ggml_tensor * ggml_inkling_control(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget);
 
     // relative-position bias, evaluated inside the kernel instead of a per-head mask:
     //   d = qpos[iq1] - kpos[ik1];  s += table[d, h, iq1, iq3]  if 0 <= d < extent

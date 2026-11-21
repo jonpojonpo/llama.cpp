@@ -9335,6 +9335,113 @@ struct test_flash_attn_ext_rel : public test_case {
     }
 };
 
+// fused Inkling 2 blocks (GGML_OP_INKLING)
+struct test_inkling_clip : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool  scale;
+    const float thr;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, scale, thr);
+    }
+
+    test_inkling_clip(std::array<int64_t, 4> ne = {128, 24, 5, 1}, bool scale = true, float thr = 22.6f)
+        : ne(ne), scale(scale), thr(thr) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * sc = nullptr;
+        if (scale) {
+            sc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(sc, "scale");
+        }
+        ggml_tensor * out = ggml_inkling_clip(ctx, a, sc, thr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // rows with norms on both sides of the threshold
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
+struct test_inkling_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_query;
+    const int     n_states;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_query, n_states, n_tokens);
+    }
+
+    test_inkling_mix(int64_t n_embd = 2304, int64_t n_query = 3, int n_states = 4, int64_t n_tokens = 5)
+        : n_embd(n_embd), n_query(n_query), n_states(n_states), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the query is a row view of a larger table, like loop_res_query
+        ggml_tensor * qt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query + 2);
+        ggml_set_name(qt, "query_table");
+        ggml_tensor * q = ggml_view_2d(ctx, qt, n_embd, n_query, qt->nb[1], qt->nb[1]);
+
+        std::vector<ggml_tensor *> states;
+        for (int i = 0; i < n_states; ++i) {
+            if (i % 2) {
+                // a slice of a wider tensor, like the outputs of a previous mix
+                ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, 2);
+                states.push_back(ggml_view_2d(ctx, w, n_embd, n_tokens, w->nb[1], w->nb[2]));
+            } else {
+                states.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens));
+            }
+        }
+        ggml_tensor * out = ggml_inkling_mix(ctx, q, states.data(), n_states);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f, 2.0f);
+        }
+    }
+};
+
+struct test_inkling_control : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rank;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_rank, n_tokens);
+    }
+
+    test_inkling_control(int64_t n_embd = 2304, int64_t n_rank = 64, int64_t n_tokens = 5)
+        : n_embd(n_embd), n_rank(n_rank), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * msg    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, n_rank);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rank, n_embd);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rank, n_embd);
+        ggml_tensor * out = ggml_inkling_control(ctx, cur, msg, down, gain, forget);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // small weights keep the tanh arguments away from saturation
+            const bool w = t->ne[0] == 2*n_embd || t->ne[0] == n_rank;
+            init_tensor_uniform(t, w ? -0.05f : -1.0f, w ? 0.05f : 1.0f);
+        }
+    }
+};
+
 // mask with 2 heads and 2 batches, broadcast over the Q heads and batches
 struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
@@ -13399,6 +13506,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 4, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+
+    // fused Inkling 2 blocks
+    for (int64_t nt : {1, 5, 64, 512}) {
+        test_cases.emplace_back(new test_inkling_clip({128, 24, nt, 1}, true));
+        test_cases.emplace_back(new test_inkling_clip({128, 8, nt, 1}, false));
+        test_cases.emplace_back(new test_inkling_clip({16, 24, nt, 1}, true, 8.0f));
+        for (int ns : {1, 2, 5, 9}) {
+            for (int64_t nq : {1, 2, 3}) {
+                test_cases.emplace_back(new test_inkling_mix(2304, nq, ns, nt));
+            }
+        }
+        test_cases.emplace_back(new test_inkling_control(2304, 64, nt));
+    }
 
     // relative-position bias in the flash attention kernels (Inkling 2)
     for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {

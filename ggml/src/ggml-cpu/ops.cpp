@@ -2181,6 +2181,137 @@ static void ggml_compute_forward_gelu(
 
 // ggml_compute_fill
 
+// ggml_compute_forward_inkling (reference implementation, rows split over the threads)
+
+static float ggml_inkling_rms_inv(const float * x, int64_t n) {
+    double sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += (double) x[i]*x[i];
+    }
+    return 1.0f/sqrtf(float(sum/n) + 1e-6f);
+}
+
+void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    switch ((ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
+        case GGML_INKLING_CLIP: {
+            const ggml_tensor * a     = dst->src[0];
+            const ggml_tensor * scale = dst->src[1];
+            const float thr = ggml_get_op_params_f32(dst, 1);
+            const int64_t ne0   = a->ne[0];
+            const int64_t nrows = ggml_nrows(a);
+            std::vector<float> x(ne0);
+            for (int64_t ir = ith; ir < nrows; ir += nth) {
+                const int64_t i1 = ir % a->ne[1];
+                const int64_t i2 = (ir / a->ne[1]) % a->ne[2];
+                const int64_t i3 = ir / (a->ne[1]*a->ne[2]);
+                const float * src = (const float *) a->data + ir*ne0;
+                const float * sc  = scale ? (const float *) ((const char *) scale->data + (i1 % scale->ne[1])*scale->nb[1] +
+                    (i2 % scale->ne[2])*scale->nb[2] + (i3 % scale->ne[3])*scale->nb[3]) : nullptr;
+                double sum = 0.0;
+                for (int64_t i = 0; i < ne0; ++i) {
+                    x[i] = sc ? src[i]*sc[i % scale->ne[0]] : src[i];
+                    sum += (double) x[i]*x[i];
+                }
+                const float norm   = sqrtf((float) sum) + 1e-6f;
+                const float factor = std::min(1.0f, std::max(0.0f, thr/norm));
+                float * out = (float *) dst->data + ir*ne0;
+                for (int64_t i = 0; i < ne0; ++i) {
+                    out[i] = x[i]*factor;
+                }
+            }
+        } break;
+        case GGML_INKLING_MIX: {
+            const ggml_tensor * query = dst->src[0];
+            const int     n_states = ggml_get_op_params_i32(dst, 1);
+            const int64_t n_embd   = query->ne[0];
+            const int64_t n_query  = query->ne[1];
+            const int64_t n_tokens = dst->ne[1];
+            std::vector<float> r(n_states*n_embd);
+            std::vector<float> p(n_states);
+            for (int64_t t = ith; t < n_tokens; t += nth) {
+                for (int i = 0; i < n_states; ++i) {
+                    const ggml_tensor * s = dst->src[1 + i];
+                    const float * x = (const float *) ((const char *) s->data + t*s->nb[1]);
+                    const float inv = ggml_inkling_rms_inv(x, n_embd);
+                    for (int64_t k = 0; k < n_embd; ++k) {
+                        r[i*n_embd + k] = x[k]*inv;
+                    }
+                }
+                for (int64_t j = 0; j < n_query; ++j) {
+                    const float * q = (const float *) ((const char *) query->data + j*query->nb[1]);
+                    float mx = -INFINITY;
+                    for (int i = 0; i < n_states; ++i) {
+                        double dot = 0.0;
+                        for (int64_t k = 0; k < n_embd; ++k) {
+                            dot += (double) q[k]*r[i*n_embd + k];
+                        }
+                        p[i] = float(dot)/sqrtf((float) n_embd);
+                        mx = std::max(mx, p[i]);
+                    }
+                    float sum = 0.0f;
+                    for (int i = 0; i < n_states; ++i) {
+                        p[i] = expf(p[i] - mx);
+                        sum += p[i];
+                    }
+                    float * out = (float *) ((char *) dst->data + t*dst->nb[1] + j*dst->nb[2]);
+                    for (int64_t k = 0; k < n_embd; ++k) {
+                        float acc = 0.0f;
+                        for (int i = 0; i < n_states; ++i) {
+                            acc += p[i]*r[i*n_embd + k];
+                        }
+                        out[k] = acc/sum;
+                    }
+                }
+            }
+        } break;
+        case GGML_INKLING_CONTROL: {
+            const ggml_tensor * cur    = dst->src[0];
+            const ggml_tensor * msg    = dst->src[1];
+            const ggml_tensor * down   = dst->src[2];
+            const ggml_tensor * gain   = dst->src[3];
+            const ggml_tensor * forget = dst->src[4];
+            const int64_t n_embd   = cur->ne[0];
+            const int64_t n_rank   = down->ne[1];
+            const int64_t n_tokens = cur->ne[1];
+            std::vector<float> h(n_rank);
+            for (int64_t t = ith; t < n_tokens; t += nth) {
+                const float * c = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+                const float * m = (const float *) ((const char *) msg->data + t*msg->nb[1]);
+                // cur and msg are rms-normed separately, then concatenated
+                const float inv_c = ggml_inkling_rms_inv(c, n_embd);
+                const float inv_m = ggml_inkling_rms_inv(m, n_embd);
+                for (int64_t r = 0; r < n_rank; ++r) {
+                    const float * d = (const float *) ((const char *) down->data + r*down->nb[1]);
+                    double ac = 0.0;
+                    double am = 0.0;
+                    for (int64_t k = 0; k < n_embd; ++k) {
+                        ac += (double) d[k]*c[k];
+                        am += (double) d[n_embd + k]*m[k];
+                    }
+                    h[r] = float(ac)*inv_c + float(am)*inv_m;
+                }
+                float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+                for (int64_t k = 0; k < n_embd; ++k) {
+                    const float * g = (const float *) ((const char *) gain->data   + k*gain->nb[1]);
+                    const float * f = (const float *) ((const char *) forget->data + k*forget->nb[1]);
+                    float ag = 0.0f;
+                    float af = 0.0f;
+                    for (int64_t r = 0; r < n_rank; ++r) {
+                        ag += g[r]*h[r];
+                        af += f[r]*h[r];
+                    }
+                    out[k] = (1.0f - tanhf(af))*c[k] + tanhf(ag)*m[k];
+                }
+            }
+        } break;
+        default:
+            GGML_ABORT("unknown inkling op");
+    }
+}
+
 static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, ggml_tensor * dst) {
     const float c = ggml_get_op_params_f32(dst, 0);
 
