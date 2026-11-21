@@ -9436,6 +9436,56 @@ struct test_inkling_sconv : public test_case {
     }
 };
 
+struct test_inkling_rel_table : public test_case {
+    const int64_t extent;
+    const int64_t n_head;
+    const int64_t n_t;
+
+    std::string vars() override {
+        return VARS_TO_STR3(extent, n_head, n_t);
+    }
+
+    test_inkling_rel_table(int64_t extent = 1024, int64_t n_head = 24, int64_t n_t = 5)
+        : extent(extent), n_head(n_head), n_t(n_t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, extent);
+        ggml_tensor * r     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, n_head, n_t);
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_t);
+        ggml_tensor * out   = ggml_inkling_rel_table(ctx, bias, r, sinks);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_inkling_situ : public test_case {
+    const int64_t n_ff;
+    const int64_t n_used;
+    const int64_t n_t;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ff, n_used, n_t);
+    }
+
+    test_inkling_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_t = 5) : n_ff(n_ff), n_used(n_used), n_t(n_t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // gate and up are the two halves of a merged gate_up output
+        ggml_tensor * gu   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_t);
+        ggml_tensor * gate = ggml_view_3d(ctx, gu, n_ff, n_used, n_t, gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gu, n_ff, n_used, n_t, gu->nb[1], gu->nb[2], n_ff*sizeof(float));
+        ggml_tensor * out  = ggml_inkling_situ(ctx, gate, up, 4.0f, 25.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -40.0f, 40.0f);
+        }
+    }
+};
+
 struct test_inkling_control : public test_case {
     const int64_t n_embd;
     const int64_t n_rank;
@@ -13545,6 +13595,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_inkling_control(2304, 64, nt));
         test_cases.emplace_back(new test_inkling_sconv(1024, nt, 1, 8));
+        test_cases.emplace_back(new test_inkling_rel_table(1024, 24, nt));
+        test_cases.emplace_back(new test_inkling_situ(1152, 8, nt));
         test_cases.emplace_back(new test_inkling_sconv(2304, nt, 1, 0));
         test_cases.emplace_back(new test_inkling_sconv(1024, nt, 2, 0));
     }

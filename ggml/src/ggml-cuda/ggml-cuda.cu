@@ -3788,6 +3788,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.norm_op         = GGML_OP_CLAMP;
     args.n_groups        = 0;
     args.n_group_used    = 0;
 
@@ -3913,7 +3914,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            // a bias-only SCALE with a tiny eps (sum + eps) acts as the clamp to eps on a sum of positive weights
+            const bool eps_scale = op == GGML_OP_CLAMP && nodes[node_idx]->op == GGML_OP_SCALE &&
+                ggml_get_op_params_f32(nodes[node_idx], 0) == 1.0f && ggml_get_op_params_f32(nodes[node_idx], 1) >= 0.0f &&
+                ggml_get_op_params_f32(nodes[node_idx], 1) <= 1e-12f && args.sigmoid;
+            if ((nodes[node_idx]->op == op || eps_scale) && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+                if (eps_scale) {
+                    args.norm_op = GGML_OP_SCALE;
+                }
                 node_idx++;
             } else {
                 args.norm = false;
@@ -4580,7 +4588,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (args.norm) {
                     ops.insert(ops.end(),
-                               { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                               { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_op, GGML_OP_DIV, GGML_OP_RESHAPE });
                     clamp = cgraph->nodes[i + ops.size() - 3];
                 }
                 if (args.scale) {
@@ -5349,7 +5357,8 @@ struct ggml_cuda_opprof {
         }
         std::string k = std::string(ggml_op_desc(first));
         if (first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) {
-            k += std::string("[") + ggml_type_name(first->src[0]->type) + " n=" + std::to_string(first->src[1]->ne[1]) + "]";
+            k += std::string("[") + ggml_type_name(first->src[0]->type) + " " + std::to_string(first->src[0]->ne[0]) + "x" +
+                std::to_string(first->src[0]->ne[1]) + " n=" + std::to_string(first->src[1]->ne[1]) + "]";
         }
         if (last != first) {
             k += std::string(" +fused->") + ggml_op_desc(last);
@@ -5383,6 +5392,11 @@ struct ggml_cuda_opprof {
         }
         n_kern += recs.size();
         n_graphs++;
+        if (n_graphs == 10 && atoi(getenv("GGML_CUDA_OPPROF")) >= 2) {
+            for (size_t i = 0; i < recs.size(); ++i) {
+                fprintf(stderr, "seq %5zu %s\n", i, recs[i].key.c_str());
+            }
+        }
     }
     ~ggml_cuda_opprof() {
         if (!enabled || n_graphs == 0) {
@@ -5883,7 +5897,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
                         if (args.norm) {
                             ops.insert(ops.end(),
-                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_op, GGML_OP_DIV, GGML_OP_RESHAPE });
                         }
                         if (args.scale) {
                             ops.insert(ops.end(), { GGML_OP_SCALE });

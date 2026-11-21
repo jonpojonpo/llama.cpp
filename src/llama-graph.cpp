@@ -2690,6 +2690,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    static const bool fused = getenv("LLAMA_INKLING_UNFUSED") == nullptr;
+                    if (fused && cur->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) && cur->ne[3] == 1) {
+                        cur = ggml_inkling_situ(ctx0, cur, up, beta, lb);
+                        cb(cur, "ffn_moe_situ", il);
+                        break;
+                    }
+
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                     if (lb > 0.0f) {

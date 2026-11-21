@@ -2290,6 +2290,8 @@ extern "C" {
         GGML_INKLING_MIX     = 1, // softmax over the rms-normed states with learned queries, weighted sum
         GGML_INKLING_CONTROL = 2, // h = D [rms(cur); rms(msg)] (normed separately); (1 - tanh(F h))*cur + tanh(G h)*msg
         GGML_INKLING_SCONV   = 3, // causal short conv with residual and optional per-head dynamic taps
+        GGML_INKLING_RELTAB  = 4, // relative bias table for ggml_flash_attn_ext_add_rel, sink in the last row
+        GGML_INKLING_SITU    = 5, // beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), lb <= 0: * u
     };
 
     // a: F32 [ne0, ne1, ne2, ne3] contiguous, scale: NULL or F32 broadcastable to a, the norm is over ne0
@@ -2324,6 +2326,22 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * w,
             struct ggml_tensor  * dyn);
+
+    // bias: F32 [n_rel, extent], r: F32 [n_rel, n_head, n_t] contiguous, sinks: F32 [n_head, n_t] contiguous rows
+    // result: F32 [extent + 1, n_head, n_t], row d < extent = bias[:, d] . r, row extent = sinks
+    GGML_API struct ggml_tensor * ggml_inkling_rel_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks);
+
+    // gate, up: F32 [ne0, ne1, ne2] with contiguous rows (may be views), result is contiguous
+    GGML_API struct ggml_tensor * ggml_inkling_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 beta,
+            float                 linear_beta);
 
     // relative-position bias, evaluated inside the kernel instead of a per-head mask:
     //   d = qpos[iq1] - kpos[ik1];  s += table[d, h, iq1, iq3]  if 0 <= d < extent

@@ -464,7 +464,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     float clamp_val = -INFINITY;
     if (clamp) {
-        clamp_val = ggml_get_op_params_f32(clamp, 0);
+        clamp_val = ggml_get_op_params_f32(clamp, clamp->op == GGML_OP_SCALE ? 1 : 0);
     }
 
     topk_moe_config config;

@@ -458,8 +458,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             if (cparams.flash_attn) {
                 // the kernel gathers the bias by distance: table [extent + 1, n_head, n_tokens], the last row is the sink logit
                 ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
-                ggml_tensor * table = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
-                table = ggml_concat(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0);
+                ggml_tensor * table;
+                if (inkling_fused() && ggml_is_contiguous(Rcur)) {
+                    table = ggml_inkling_rel_table(ctx0, layer.attn_rel_bias, Rcur, sinks);
+                } else {
+                    table = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+                    table = ggml_concat(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0);
+                }
                 cb(table, "rel_table", il);
 
                 cur = build_attn_rel_fa(inp,

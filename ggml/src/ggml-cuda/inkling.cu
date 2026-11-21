@@ -375,6 +375,77 @@ static void inkling_sconv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// RELTAB: block per (head, token), the r vector is broadcast from shared memory, one thread per distance
+
+template <int n_rel>
+static __global__ void inkling_rel_table_kernel(
+        const float * __restrict__ bias, const float * __restrict__ r, const float * __restrict__ sinks,
+        float * __restrict__ dst, const int extent, const int n_head, const int64_t ss1, const int64_t os1, const int64_t os2) {
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    __shared__ float rv[n_rel];
+    if (threadIdx.x < n_rel) {
+        rv[threadIdx.x] = r[(int64_t(t)*n_head + h)*n_rel + threadIdx.x];
+    }
+    __syncthreads();
+
+    float * out = dst + t*os2 + h*os1;
+    for (int d = threadIdx.x; d < extent; d += blockDim.x) {
+        const float * b = bias + int64_t(d)*n_rel;
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < n_rel; ++k) {
+            acc += b[k]*rv[k];
+        }
+        out[d] = acc;
+    }
+    if (threadIdx.x == 0) {
+        out[extent] = sinks[t*ss1 + h];
+    }
+}
+
+static void inkling_rel_table(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * bias  = dst->src[0];
+    const ggml_tensor * r     = dst->src[1];
+    const ggml_tensor * sinks = dst->src[2];
+    GGML_ASSERT(bias->ne[0] == 16);
+    const dim3 grid(r->ne[1], r->ne[2], 1);
+    inkling_rel_table_kernel<16><<<grid, dim3(256, 1, 1), 0, ctx.stream()>>>(
+        (const float *) bias->data, (const float *) r->data, (const float *) sinks->data, (float *) dst->data,
+        bias->ne[1], r->ne[1], sinks->nb[1]/sizeof(float), dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SITU: elementwise over [ne0, ne1, ne2] with row strides
+
+static __global__ void inkling_situ_kernel(
+        const float * __restrict__ g, const float * __restrict__ u, float * __restrict__ dst,
+        const int ne0, const int ne1, const int64_t gs1, const int64_t gs2, const int64_t us1, const int64_t us2,
+        const int64_t os1, const int64_t os2, const float beta, const float lb) {
+    const int i  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int ir = blockIdx.y;
+    if (i >= ne0) {
+        return;
+    }
+    const int i1 = ir % ne1;
+    const int i2 = ir / ne1;
+    const float gv = g[i1*gs1 + i2*gs2 + i];
+    const float uv = u[i1*us1 + i2*us2 + i];
+    const float act = beta*tanhf(gv/beta) * (1.0f/(1.0f + expf(-gv)));
+    dst[i1*os1 + i2*os2 + i] = act * (lb > 0.0f ? lb*tanhf(uv/lb) : uv);
+}
+
+static void inkling_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * g = dst->src[0];
+    const ggml_tensor * u = dst->src[1];
+    const dim3 grid((g->ne[0] + 255)/256, g->ne[1]*g->ne[2], 1);
+    inkling_situ_kernel<<<grid, dim3(256, 1, 1), 0, ctx.stream()>>>(
+        (const float *) g->data, (const float *) u->data, (float *) dst->data, g->ne[0], g->ne[1],
+        g->nb[1]/sizeof(float), g->nb[2]/sizeof(float), u->nb[1]/sizeof(float), u->nb[2]/sizeof(float),
+        dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), ggml_get_op_params_f32(dst, 1), ggml_get_op_params_f32(dst, 2));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_inkling_supported(const ggml_tensor * dst) {
     switch ((ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
@@ -386,6 +457,10 @@ bool ggml_cuda_inkling_supported(const ggml_tensor * dst) {
             return true;
         case GGML_INKLING_SCONV:
             return dst->src[1]->ne[0] == 4;
+        case GGML_INKLING_RELTAB:
+            return dst->src[0]->ne[0] == 16;
+        case GGML_INKLING_SITU:
+            return true;
     }
     return false;
 }
@@ -396,6 +471,8 @@ void ggml_cuda_op_inkling(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_INKLING_MIX:     inkling_mix(ctx, dst);     break;
         case GGML_INKLING_CONTROL: inkling_control(ctx, dst); break;
         case GGML_INKLING_SCONV:   inkling_sconv(ctx, dst);   break;
+        case GGML_INKLING_RELTAB:  inkling_rel_table(ctx, dst); break;
+        case GGML_INKLING_SITU:    inkling_situ(ctx, dst);    break;
         default: GGML_ABORT("unknown inkling op");
     }
 }

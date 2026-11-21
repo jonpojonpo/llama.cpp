@@ -2339,6 +2339,48 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
                 }
             }
         } break;
+        case GGML_INKLING_RELTAB: {
+            const ggml_tensor * bias  = dst->src[0];
+            const ggml_tensor * r     = dst->src[1];
+            const ggml_tensor * sinks = dst->src[2];
+            const int64_t n_rel  = bias->ne[0];
+            const int64_t extent = bias->ne[1];
+            const int64_t n_head = r->ne[1];
+            const int64_t n_t    = r->ne[2];
+            for (int64_t ir = ith; ir < n_head*n_t; ir += nth) {
+                const int64_t h = ir % n_head;
+                const int64_t t = ir / n_head;
+                const float * rv = (const float *) r->data + ir*n_rel;
+                float * out = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2]);
+                for (int64_t d = 0; d < extent; ++d) {
+                    const float * b = (const float *) bias->data + d*n_rel;
+                    float acc = 0.0f;
+                    for (int64_t k = 0; k < n_rel; ++k) {
+                        acc += b[k]*rv[k];
+                    }
+                    out[d] = acc;
+                }
+                out[extent] = ((const float *) ((const char *) sinks->data + t*sinks->nb[1]))[h];
+            }
+        } break;
+        case GGML_INKLING_SITU: {
+            const ggml_tensor * g = dst->src[0];
+            const ggml_tensor * u = dst->src[1];
+            const float beta = ggml_get_op_params_f32(dst, 1);
+            const float lb   = ggml_get_op_params_f32(dst, 2);
+            const int64_t ne0 = g->ne[0];
+            for (int64_t ir = ith; ir < g->ne[1]*g->ne[2]; ir += nth) {
+                const int64_t i1 = ir % g->ne[1];
+                const int64_t i2 = ir / g->ne[1];
+                const float * gr = (const float *) ((const char *) g->data + i1*g->nb[1] + i2*g->nb[2]);
+                const float * ur = (const float *) ((const char *) u->data + i1*u->nb[1] + i2*u->nb[2]);
+                float * out = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+                for (int64_t i = 0; i < ne0; ++i) {
+                    const float act = beta*tanhf(gr[i]/beta) * (1.0f/(1.0f + expf(-gr[i])));
+                    out[i] = act * (lb > 0.0f ? lb*tanhf(ur[i]/lb) : ur[i]);
+                }
+            }
+        } break;
         default:
             GGML_ABORT("unknown inkling op");
     }

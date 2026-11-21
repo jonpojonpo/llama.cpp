@@ -5383,6 +5383,51 @@ struct ggml_tensor * ggml_inkling_sconv(
     return result;
 }
 
+struct ggml_tensor * ggml_inkling_rel_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * sinks) {
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias));
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && ggml_is_contiguous(r) && r->ne[0] == bias->ne[0]);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->nb[0] == sizeof(float));
+    GGML_ASSERT(sinks->ne[0] == r->ne[1] && ggml_nrows(sinks) == r->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, bias->ne[1] + 1, r->ne[1], r->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_RELTAB);
+
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = bias;
+    result->src[1] = r;
+    result->src[2] = sinks;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        float                 beta,
+        float                 linear_beta) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(gate, up) && gate->ne[3] == 1 && beta > 0.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, gate->ne);
+
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_SITU);
+    ggml_set_op_params_f32(result, 1, beta);
+    ggml_set_op_params_f32(result, 2, linear_beta);
+
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = gate;
+    result->src[1] = up;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_inkling_control(
         struct ggml_context * ctx,
         struct ggml_tensor  * cur,
