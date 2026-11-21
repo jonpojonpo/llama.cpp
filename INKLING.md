@@ -16,6 +16,7 @@ Credit for those goes to their authors. The commits added here are the five on t
 | `inkling2: fused short convolution (GGML_INKLING_SCONV)` | Fused shortconv and dynamic taps. |
 | `inkling2: fused rel table and SiTU; topk-moe fusion ...` | Fused relative-bias table, expert SiTU activation, and MoE routing. |
 | `dspark: cap the inkling2 markov loop (LLAMA_DSPARK_STEPS) ...` | The draft head no longer re-runs the 201K-vocab output layer for draft positions that are never used. |
+| `dspark: fold the target lm head into the inkling2 markov head ...` | The output layer is multiplied into the draft head's projection once at load, so each draft step reads 52 MB instead of 490 MB. Greedy draft tokens are picked on the GPU, with no logits copy or CPU sampler. Draft step 4.7 -> 1.7 ms. |
 
 The decode graph drops from 6,830 to about 2,700 kernels per token. All new ops have
 `test-backend-ops` cases (CUDA vs CPU).
@@ -27,13 +28,13 @@ RTX 4090 (24 GB), `Inkling-2-Mini-UD-Q4_K_XL.gguf`, q8_0 KV cache, one request a
 | | Before | This branch |
 |---|---:|---:|
 | Generation, no draft | 72 tok/s | **106 tok/s** |
-| With DSpark draft (depth 3): code / bash | ~90 / ~85 | **~135 / ~130** |
-| With DSpark draft: prose | ~56 | **~88** |
+| With DSpark draft (depth 3): code / bash | ~90 / ~85 | **~157 / ~152** |
+| With DSpark draft: prose | ~56 | **~104** |
 | Prompt processing, 2K-token prompt | 1,494 tok/s | **5,430 tok/s** |
 | Context that fits in 24 GB | 98K | **131K** |
 
-Quality vs the unfused graph: mean KL divergence ~0.003, same top token ~98%. On prose the
-draft is still slower than plain generation, so turn it off for prose-heavy work.
+Quality vs the unfused graph: mean KL divergence ~0.003, same top token ~98%. Since the folded
+draft head, prose with the draft (~104 tok/s) is level with plain generation (~102 in the same server test).
 
 ## Build
 
@@ -55,7 +56,7 @@ build/bin/llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-n-min 1
 ```
 
-Drop the four draft lines (`-md` onward) for prose.
+Prose no longer gains from dropping the draft lines (`-md` onward); code and shell gain ~50%.
 
 ## Switches
 
