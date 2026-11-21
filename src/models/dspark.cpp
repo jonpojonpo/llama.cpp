@@ -957,9 +957,15 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
+    ggml_tensor * bias;
+    if (model.dspark_head_low) {
+        // output x (hidden_out x latent + b) with the folded head, see llama_dspark_fold_head
+        bias = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_head_low, latent), model.dspark_head_low_b);
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(target.output, correction, target.output_s);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+    }
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
     }
@@ -1100,8 +1106,6 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
     };
     auto * context = column(f_rnn, 0);
-    auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
-    tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
     // LLAMA_DSPARK_STEPS=n: run the recurrent head for the first n draft positions only (the server drafts at most
     // --spec-draft-n-max), the later rows keep the uncorrected logits and state
@@ -1111,17 +1115,23 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             const float cap = model.hparams.f_final_logit_softcapping;
             auto * col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, column(base, i), 1.0f/cap)), cap);
             states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-            logits = ggml_concat(ctx0, logits, col, 1);
+            if (n_outputs > 0) {
+                logits = ggml_concat(ctx0, logits, col, 1);
+            }
             continue;
         }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
-        states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-        logits = ggml_concat(ctx0, logits, col, 1);
-        // Select the first maximum, independent of backend argmax tie order.
-        auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-        auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
-        auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
-        prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+        if (n_outputs > 0) {
+            logits = ggml_concat(ctx0, logits, col, 1);
+        }
+        // the first maximum (CPU and CUDA argmax break ties by the lowest index)
+        auto * valid = col->ne[0] == hparams.n_vocab_unpadded ? col :
+            ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+        prev = ggml_argmax(ctx0, valid);
+        // the greedy token + 1 goes to state row element [rank] (0: not drafted on the device), so a greedy
+        // drafter can skip the logits
+        auto * tok = ggml_scale_bias(ctx0, ggml_cast(ctx0, ggml_reshape_2d(ctx0, prev, 1, nb), GGML_TYPE_F32), 1.0f, 1.0f);
+        states = ggml_concat(ctx0, states, ggml_pad(ctx0, ggml_concat(ctx0, state, tok, 0), n_embd - rank - 1, 0, 0, 0), 1);
     }
     const auto block_order = [&](ggml_tensor * t) {
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
@@ -1130,6 +1140,11 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     res->t_h_nextn = block_order(states);
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
+    if (n_outputs == 0) {
+        // greedy device drafting reads the tokens from the state rows
+        res->t_logits = base;
+        return;
+    }
     logits = block_order(logits);
     res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
 }

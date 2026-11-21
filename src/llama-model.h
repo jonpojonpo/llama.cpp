@@ -945,6 +945,10 @@ struct llama_model {
     struct ggml_tensor * dspark_norm         = nullptr;
     struct ggml_tensor * dspark_hidden_out   = nullptr;
     struct ggml_tensor * dspark_hidden_out_b = nullptr;
+    // Inkling2 DSpark: target lm head folded into hidden_out by the draft context (llama_dspark_fold_head)
+    mutable struct ggml_tensor * dspark_head_low   = nullptr; // [rank, n_vocab] = (output x hidden_out)^T
+    mutable struct ggml_tensor * dspark_head_low_b = nullptr; // [n_vocab]       = output x hidden_out_b
+    mutable std::shared_ptr<void> dspark_head_mem;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

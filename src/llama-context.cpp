@@ -166,6 +166,123 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Inkling2 DSpark: the recurrent head adds output x (hidden_out x latent + hidden_out_b) to the logits at every draft
+// step. Fold the target lm head into that projection once, so each step reads [rank, n_vocab] instead of the lm head.
+static void llama_dspark_fold_head(const llama_model & model, const llama_model & target, const std::vector<ggml_backend_ptr> & backends) {
+    const ggml_tensor * W = target.output;
+    const ggml_tensor * H = model.dspark_hidden_out;
+    const ggml_tensor * B = model.dspark_hidden_out_b;
+    if (getenv("LLAMA_DSPARK_NO_FOLD") || model.dspark_head_low || !W || !H || !B || target.output_s ||
+            !W->buffer || !H->buffer || !B->buffer || B->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int64_t n_embd = W->ne[0], n_vocab = W->ne[1], rank = H->ne[0];
+    const ggml_type type = getenv("LLAMA_DSPARK_FOLD_F16") ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+    if (H->ne[1] != n_embd || B->ne[0] != n_embd || rank % ggml_blck_size(type) != 0) {
+        return;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(W->buffer);
+    ggml_backend_t backend = nullptr;
+    for (const auto & b : backends) {
+        if (ggml_backend_supports_buft(b.get(), buft)) {
+            backend = b.get();
+            break;
+        }
+    }
+    if (!backend) {
+        return;
+    }
+    const int64_t t_start = ggml_time_us();
+
+    // X = [hidden_out^T | hidden_out_b], [n_embd, rank + 1]
+    std::vector<float> x((size_t) n_embd*(rank + 1));
+    {
+        std::vector<uint8_t> raw(ggml_nbytes(H));
+        ggml_backend_tensor_get(H, raw.data(), 0, raw.size());
+        std::vector<float> h((size_t) n_embd*rank);
+        ggml_get_type_traits(H->type)->to_float(raw.data(), h.data(), (int64_t) h.size());
+        for (int64_t e = 0; e < n_embd; ++e) {
+            for (int64_t r = 0; r < rank; ++r) {
+                x[r*n_embd + e] = h[e*rank + r];
+            }
+        }
+        ggml_backend_tensor_get(B, x.data() + rank*n_embd, 0, n_embd*sizeof(float));
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr ctx_x { ggml_init(ip) };
+    ggml_tensor * X = ggml_new_tensor_2d(ctx_x.get(), GGML_TYPE_F32, n_embd, rank + 1);
+    ggml_backend_buffer_ptr buf_x { ggml_backend_alloc_ctx_tensors(ctx_x.get(), backend) };
+    if (!buf_x) {
+        return;
+    }
+    ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
+
+    const size_t row_size = ggml_row_size(type, rank);
+    std::vector<uint8_t> low((size_t) n_vocab*row_size);
+    std::vector<float>   low_b(n_vocab);
+    const int64_t chunk = 16384;
+    std::vector<float> y((size_t) chunk*(rank + 1)), rows((size_t) chunk*rank);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = galloc != nullptr;
+    for (int64_t v0 = 0; ok && v0 < n_vocab; v0 += chunk) {
+        const int64_t nc = std::min(chunk, n_vocab - v0);
+        ggml_context_ptr ctx { ggml_init(ip) };
+        ggml_tensor * w = ggml_view_2d(ctx.get(), const_cast<ggml_tensor *>(W), n_embd, nc, W->nb[1], v0*W->nb[1]);
+        ggml_tensor * Y = ggml_mul_mat(ctx.get(), w, X); // [nc, rank + 1]
+        ggml_cgraph * gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, Y);
+        ok = ggml_gallocr_alloc_graph(galloc, gf) && ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        if (!ok) {
+            break;
+        }
+        ggml_backend_tensor_get(Y, y.data(), 0, ggml_nbytes(Y));
+        for (int64_t v = 0; v < nc; ++v) {
+            for (int64_t r = 0; r < rank; ++r) {
+                rows[v*rank + r] = y[r*nc + v];
+            }
+            low_b[v0 + v] = y[rank*nc + v];
+        }
+        if (type == GGML_TYPE_F16) {
+            ggml_fp32_to_fp16_row(rows.data(), (ggml_fp16_t *) (low.data() + v0*row_size), nc*rank);
+        } else {
+            ggml_quantize_chunk(type, rows.data(), low.data() + v0*row_size, 0, nc, rank, nullptr);
+        }
+    }
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+    }
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: failed to fold the lm head, using the full head per draft step\n", __func__);
+        return;
+    }
+
+    struct holder {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    };
+    auto mem = std::make_shared<holder>();
+    mem->ctx.reset(ggml_init(ip));
+    ggml_tensor * t_low   = ggml_new_tensor_2d(mem->ctx.get(), type, rank, n_vocab);
+    ggml_tensor * t_low_b = ggml_new_tensor_1d(mem->ctx.get(), GGML_TYPE_F32, n_vocab);
+    ggml_set_name(t_low,   "dspark_head_low");
+    ggml_set_name(t_low_b, "dspark_head_low_b");
+    mem->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mem->ctx.get(), buft));
+    if (!mem->buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate the folded lm head\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(mem->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(t_low,   low.data(),   0, low.size());
+    ggml_backend_tensor_set(t_low_b, low_b.data(), 0, low_b.size()*sizeof(float));
+    model.dspark_head_low   = t_low;
+    model.dspark_head_low_b = t_low_b;
+    model.dspark_head_mem   = mem;
+    LLAMA_LOG_INFO("%s: folded the %s lm head into the DSpark head: %s [%lld, %lld], %.1f MiB, %.0f ms\n", __func__,
+            ggml_type_name(W->type), ggml_type_name(type), (long long) rank, (long long) n_vocab,
+            ggml_backend_buffer_get_size(mem->buf.get())/1024.0/1024.0, (ggml_time_us() - t_start)/1e3);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -535,6 +652,10 @@ llama_context::llama_context(
                     ggml_backend_buffer_name    (buf_output.get()),
                     ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
         }
+    }
+
+    if (!hparams.vocab_only && model.arch == LLM_ARCH_DFLASH && model.dspark_hidden_out && cparams.ctx_other) {
+        llama_dspark_fold_head(model, *llama_get_model(cparams.ctx_other), backends);
     }
 
     // init the memory module

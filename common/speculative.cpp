@@ -1455,6 +1455,14 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
     }
 
+    // greedy Inkling2 drafting reads the tokens the graph selected, when the graph runs the recurrent head for every
+    // drafted position (LLAMA_DSPARK_STEPS >= n_max) and LLAMA_DSPARK_HOST_SAMPLE is not set
+    bool device_greedy() const {
+        static const int steps = getenv("LLAMA_DSPARK_STEPS") ? std::max(1, atoi(getenv("LLAMA_DSPARK_STEPS"))) : INT32_MAX;
+        static const bool host = getenv("LLAMA_DSPARK_HOST_SAMPLE") != nullptr;
+        return has_rnn_context && !params.probabilistic && !host && params.n_max <= steps && n_embd_dec > markov_rank;
+    }
+
 protected:
     void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
         if (!has_rnn_context) {
@@ -1506,7 +1514,7 @@ public:
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !device_greedy());
                 if (has_rnn_context) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;
@@ -1626,6 +1634,22 @@ public:
                     if (dp.result_q) {
                         dp.result_q->push_back(std::move(q));
                     }
+                }
+                continue;
+            }
+
+            if (device_greedy()) {
+                // the graph took the first maximum of every recurrent step, token + 1 at element [markov_rank] of the state row
+                const float * rows = llama_get_embeddings_nextn(ctx_dft);
+                for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
+                    const float v = rows[(size_t) (beg + i)*n_embd_dec + markov_rank];
+                    if (v < 1.0f) {
+                        throw std::runtime_error("DSpark device drafting: the token was not computed");
+                    }
+                    result.push_back((llama_token) v - 1);
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
                 }
                 continue;
             }
