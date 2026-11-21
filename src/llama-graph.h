@@ -810,6 +810,11 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // flash attention evaluates the bias in the kernel from the positions (ggml_flash_attn_ext_add_rel)
+    ggml_tensor * self_kpos     = nullptr; // I32 [n_kv,     n_stream]
+    ggml_tensor * self_kpos_swa = nullptr; // I32 [n_kv_swa, n_stream]
+    ggml_tensor * self_qpos     = nullptr; // I32 [n_batch]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1556,6 +1561,27 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il) const;
+
+    // flash attention with the relative-position bias evaluated in the kernel
+    // table: [extent + 1, n_head_q, n_tokens], rows 0..extent-1 the bias by distance, row extent the sink logit
+    ggml_tensor * build_attn_rel_fa(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table,
+                  float   kq_scale,
+                    int   il) const;
+
+    // consumed by the next flash attention node of build_attn_mha
+    mutable struct {
+        ggml_tensor * table = nullptr;
+        ggml_tensor * kpos  = nullptr;
+        ggml_tensor * qpos  = nullptr;
+    } rel_pending;
 
     //
     // pooling

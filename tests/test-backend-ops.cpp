@@ -9247,6 +9247,94 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+
+// relative-position bias evaluated in the kernel: bias table per (query, head) indexed by qpos - kpos, plus a per-(query, head) sink
+struct test_flash_attn_ext_rel : public test_case {
+    const int64_t hs;
+    const int64_t nh;     // K/V heads
+    const int64_t gqa;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_seq;
+    const int64_t extent;
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, gqa, kv, nb, n_seq, extent, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_rel(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 3, int64_t kv = 1024, int64_t nb = 8,
+                            int64_t n_seq = 1, int64_t extent = 256, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_seq(n_seq), extent(extent), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_seq);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hs, 2*kv, nh, n_seq);
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hs, 2*kv, nh, n_seq);
+        ggml_tensor * k  = ggml_view_4d(ctx, k0, hs, kv, nh, n_seq, k0->nb[1], k0->nb[2], k0->nb[3], 0);
+        ggml_tensor * v  = ggml_view_4d(ctx, v0, hs, kv, nh, n_seq, v0->nb[1], v0->nb[2], v0->nb[3], 0);
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_seq);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * table = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, extent + 1, nh*gqa, nb, n_seq);
+        ggml_set_name(table, "table");
+        ggml_tensor * kpos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_seq);
+        ggml_set_name(kpos, "kpos");
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, n_seq);
+        ggml_set_name(qpos, "qpos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_rel(out, table, kpos, qpos);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(1234);
+        // K/V cells hold positions 0..kv-1 rotated like a ring buffer, ~5% of the cells are empty
+        std::vector<int32_t> kpos(kv*n_seq);
+        std::vector<int32_t> qpos(nb*n_seq);
+        std::vector<ggml_fp16_t> mask(kv*nb*n_seq);
+        for (int64_t s = 0; s < n_seq; ++s) {
+            const int64_t shift = gen() % kv;
+            for (int64_t i = 0; i < kv; ++i) {
+                kpos[s*kv + i] = gen() % 20 == 0 ? INT32_MAX/2 : int32_t((i + shift) % kv);
+            }
+            for (int64_t j = 0; j < nb; ++j) {
+                // the last nb positions, causal against the cells
+                qpos[s*nb + j] = int32_t(kv - nb + j);
+                for (int64_t i = 0; i < kv; ++i) {
+                    const int32_t p = kpos[s*kv + i];
+                    mask[(s*nb + j)*kv + i] = ggml_fp32_to_fp16(p <= qpos[s*nb + j] ? 0.0f : -INFINITY);
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kpos") == 0) {
+                ggml_backend_tensor_set(t, kpos.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "qpos") == 0) {
+                ggml_backend_tensor_set(t, qpos.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                ggml_backend_tensor_set(t, mask.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "table") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // mask with 2 heads and 2 batches, broadcast over the Q heads and batches
 struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
@@ -13311,6 +13399,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 4, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+
+    // relative-position bias in the flash attention kernels (Inkling 2)
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 2, 3, 5, 8, 33, 128, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1024, nb, 1, 256,  t));
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 4096, nb, 1, 1024, t));
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 2, 4, 2048, nb, 2, 1024, t));
+        }
+    }
 
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {

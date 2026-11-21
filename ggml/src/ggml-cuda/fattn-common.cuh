@@ -18,6 +18,19 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// relative-position bias evaluated inside the kernels (ggml_flash_attn_ext_add_rel), extent == 0: disabled
+struct fattn_rel_params {
+    const char    * table;  // F32 [extent + 1, n_head, n_q, n_seq], slot extent is the per-(q, head) sink
+    int64_t         nb1;    // table byte strides: head, q, seq
+    int64_t         nb2;
+    int64_t         nb3;
+    const int32_t * kpos;   // I32 [n_kv, n_seq]
+    const int32_t * qpos;   // I32 [n_q,  n_seq]
+    int32_t         s_kpos; // elements per seq
+    int32_t         s_qpos;
+    int32_t         extent;
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -40,7 +53,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_params rel);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1309,6 +1323,22 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    fattn_rel_params rel = {};
+    if (const ggml_tensor * table = dst->src[6]) {
+        const ggml_tensor * kpos = dst->src[7];
+        const ggml_tensor * qpos = dst->src[8];
+        GGML_ASSERT(!kv_rows && !sinks && (!mask || mask->ne[2] == 1));
+        rel.table  = (const char *) table->data;
+        rel.nb1    = table->nb[1];
+        rel.nb2    = table->nb[2];
+        rel.nb3    = table->nb[3];
+        rel.kpos   = (const int32_t *) kpos->data;
+        rel.qpos   = (const int32_t *) qpos->data;
+        rel.s_kpos = kpos->nb[1] / sizeof(int32_t);
+        rel.s_qpos = qpos->nb[1] / sizeof(int32_t);
+        rel.extent = table->ne[0] - 1;
+    }
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1324,7 +1354,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        rel
     );
     CUDA_CHECK(cudaGetLastError());
 

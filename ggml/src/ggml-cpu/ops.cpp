@@ -8868,6 +8868,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rel_table = dst->src[6];
+    const ggml_tensor * rel_kpos  = dst->src[7];
+    const ggml_tensor * rel_qpos  = dst->src[8];
+    const int64_t       rel_extent = rel_table ? rel_table->ne[0] - 1 : 0;
     const ggml_tensor * kv_rows = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
@@ -8973,6 +8977,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        const float   * rel_t  = rel_table ? (const float *) ((const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] + iq3*rel_table->nb[3]) : nullptr;
+        const int32_t * rel_kp = rel_table ? (const int32_t *) ((const char *) rel_kpos->data + iq3*rel_kpos->nb[1]) : nullptr;
+        const int32_t   rel_qp = rel_table ? ((const int32_t *) ((const char *) rel_qpos->data + iq3*rel_qpos->nb[1]))[iq1] : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -9000,6 +9008,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             s += mv; // apply mask
+
+            if (rel_t) {
+                const int64_t d = int64_t(rel_qp) - rel_kp[ik1];
+                if (d >= 0 && d < rel_extent) {
+                    s += rel_t[d];
+                }
+            }
 
             const float Mold = M;
 
@@ -9035,8 +9050,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         // sinks - apply only on the first kv-chunk
-        if (sinks && ic_start == 0) {
-            const float s = ((float *)((char *) sinks->data))[h];
+        if ((sinks || rel_t) && ic_start == 0) {
+            const float s = rel_t ? rel_t[rel_extent] : ((float *)((char *) sinks->data))[h];
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -9553,7 +9568,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !dst->src[6] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

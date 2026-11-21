@@ -152,7 +152,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr &&
+    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr && dst->src[6] == nullptr &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
@@ -576,7 +576,25 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst);
+
+// the relative-position bias (src[6]) is implemented in the vec and MMA kernels only
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    if (dst->src[6] == nullptr) {
+        return ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+    }
+    const ggml_tensor * mask = dst->src[3];
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    if (dst->src[4] || dst->src[5] || (mask && mask->ne[2] != 1) || max_bias != 0.0f ||
+            !turing_mma_available(ggml_cuda_info().devices[device].cc)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+    return kernel == BEST_FATTN_KERNEL_TILE ? BEST_FATTN_KERNEL_MMA_F16 : kernel;
+}
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -697,7 +715,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
-                const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&
+                const bool sparse_decode = !dst->src[6] && gqa_opt_applies && gqa_ratio > 4 &&
                     ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
                     ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
                 if (!sparse_decode && cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 &&

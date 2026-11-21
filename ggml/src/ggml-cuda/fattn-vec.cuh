@@ -40,7 +40,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_params rel) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -115,6 +116,16 @@ static __global__ void flash_attn_ext_vec(
     const half * maskh  = mask ? (const half  *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    // relative-position bias: table row of (sequence, head, ic0), K positions of this sequence, Q position per column
+    const float   * rel_t  = rel.extent ? (const float *) (rel.table + rel.nb3*sequence + rel.nb1*head + rel.nb2*ic0) : nullptr;
+    const int32_t * rel_kp = rel.extent ? rel.kpos + int64_t(rel.s_kpos)*sequence : nullptr;
+    const int       rel_st = rel.nb2 / sizeof(float);
+    int rel_qp[ncols];
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        rel_qp[j] = rel_t && (ncols == 1 || ic0 + j < int(ne01.z)) ? rel.qpos[int64_t(rel.s_qpos)*sequence + ic0 + j] : INT_MIN/2;
+    }
 
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
     constexpr int nwarps = nthreads / WARP_SIZE;
@@ -304,6 +315,13 @@ static __global__ void flash_attn_ext_vec(
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
+                if (rel_t) {
+                    const int d = rel_qp[j] - rel_kp[k_VKQ_0 + i_KQ];
+                    if (d >= 0 && d < rel.extent) {
+                        sum += rel_t[j*rel_st + d];
+                    }
+                }
+
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
@@ -401,9 +419,7 @@ static __global__ void flash_attn_ext_vec(
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
-    if (sinks && blockIdx.y == 0) {
-        const float sink = ((const float *) sinks)[head];
-
+    if ((sinks || rel_t) && blockIdx.y == 0) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -411,6 +427,9 @@ static __global__ void flash_attn_ext_vec(
             if (j0 + nwarps > ncols && j >= ncols) {
                 break;
             }
+
+            const float sink = !rel_t ? ((const float *) sinks)[head] :
+                (ncols == 1 || ic0 + j < int(ne01.z)) ? rel_t[j*rel_st + rel.extent] : 0.0f;
 
             const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
             const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
@@ -545,7 +564,7 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, rel);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

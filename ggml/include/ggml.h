@@ -2283,6 +2283,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // relative-position bias, evaluated inside the kernel instead of a per-head mask:
+    //   d = qpos[iq1] - kpos[ik1];  s += table[d, h, iq1, iq3]  if 0 <= d < extent
+    //   and a per-(query, head) attention sink table[extent, h, iq1, iq3]
+    // table: F32 [extent + 1, n_head, n_q, n_seq], kpos: I32 [n_kv, n_seq], qpos: I32 [n_q, n_seq]
+    // the regular mask must not have a head dimension; excludes sinks and kv_rows
+    GGML_API void ggml_flash_attn_ext_add_rel(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * kpos,
+            struct ggml_tensor * qpos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
