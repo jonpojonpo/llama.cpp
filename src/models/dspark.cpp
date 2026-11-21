@@ -1103,7 +1103,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
+    // LLAMA_DSPARK_STEPS=n: run the recurrent head for the first n draft positions only (the server drafts at most
+    // --spec-draft-n-max), the later rows keep the uncorrected logits and state
+    static const int64_t max_steps = getenv("LLAMA_DSPARK_STEPS") ? std::max(1, atoi(getenv("LLAMA_DSPARK_STEPS"))) : INT64_MAX;
     for (int64_t i = 1; i < block; ++i) {
+        if (i > max_steps) {
+            const float cap = model.hparams.f_final_logit_softcapping;
+            auto * col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, column(base, i), 1.0f/cap)), cap);
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
+            logits = ggml_concat(ctx0, logits, col, 1);
+            continue;
+        }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);

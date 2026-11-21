@@ -5392,7 +5392,7 @@ struct ggml_cuda_opprof {
         }
         n_kern += recs.size();
         n_graphs++;
-        if (n_graphs == 10 && atoi(getenv("GGML_CUDA_OPPROF")) >= 2) {
+        if (n_graphs == 10 && (atoi(getenv("GGML_CUDA_OPPROF")) >= 2 || strcmp(getenv("GGML_CUDA_OPPROF"), "small") == 0)) {
             for (size_t i = 0; i < recs.size(); ++i) {
                 fprintf(stderr, "seq %5zu %s\n", i, recs[i].key.c_str());
             }
@@ -5519,7 +5519,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            const bool opprof = g_opprof.enabled && !use_cuda_graph;
+            // GGML_CUDA_OPPROF=small: only graphs with < 400 nodes (e.g. a draft model next to its target)
+            static const bool opprof_small = g_opprof.enabled && strcmp(getenv("GGML_CUDA_OPPROF"), "small") == 0;
+            const bool opprof = g_opprof.enabled && !use_cuda_graph && (!opprof_small || cgraph->n_nodes < (getenv("GGML_CUDA_OPPROF_MAXNODES") ? atoi(getenv("GGML_CUDA_OPPROF_MAXNODES")) : 400));
             if (opprof) {
                 g_opprof.begin(cuda_ctx->stream());
             }

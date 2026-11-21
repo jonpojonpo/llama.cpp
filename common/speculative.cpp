@@ -1524,9 +1524,30 @@ public:
         }
 
         const bool sample_rnn = has_rnn_context && params.probabilistic;
+        static const bool dbg_time = getenv("LLAMA_DSPARK_TIMING") != nullptr;
+        static int64_t t_dec = 0, t_smp = 0, n_calls = 0;
+        if (dbg_time) {
+            llama_synchronize(params.ctx_tgt);
+            llama_synchronize(ctx_dft);
+        }
+        const int64_t t0 = ggml_time_us();
         // decode all sequence's noise block in a single batch
         int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
                              : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (dbg_time) {
+            llama_synchronize(ctx_dft);
+        }
+        const int64_t t1 = ggml_time_us();
+        struct timing_guard {
+            bool on; int64_t t1; int64_t & t_dec; int64_t & t_smp; int64_t & n; int64_t dt_dec;
+            ~timing_guard() {
+                if (!on) return;
+                t_dec += dt_dec; t_smp += ggml_time_us() - t1; n++;
+                if (n % 100 == 0) {
+                    LOG_INF("dspark timing: decode %.3f ms, sample %.3f ms per draft (%lld calls)\n", t_dec/1e3/n, t_smp/1e3/n, (long long) n);
+                }
+            }
+        } tg{dbg_time, t1, t_dec, t_smp, n_calls, t1 - t0};
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
@@ -2938,6 +2959,14 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // adaptive drafting (LLAMA_SPEC_ADAPTIVE=<min accepted tokens per draft>): when the moving average of the
+    // accepted tokens per draft falls below the threshold, skip drafting for LLAMA_SPEC_ADAPTIVE_SKIP tokens, then probe
+    float adapt_min  = 0.0f;
+    int   adapt_skip = 16;
+    std::vector<float> adapt_ema;
+    std::vector<int>   adapt_left;
+    std::vector<bool>  adapt_drafted;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3552,6 +3581,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE")) {
+        result->adapt_min = std::max(0.0f, (float) atof(env));
+        if (const char * env_skip = getenv("LLAMA_SPEC_ADAPTIVE_SKIP")) {
+            result->adapt_skip = std::max(1, atoi(env_skip));
+        }
+        result->adapt_ema.assign(n_seq, result->adapt_min + 1.0f);
+        result->adapt_left.assign(n_seq, 0);
+        result->adapt_drafted.assign(n_seq, false);
+        LOG_INF("%s: adaptive drafting: min %.2f accepted tokens per draft, pause %d tokens\n", __func__, result->adapt_min, result->adapt_skip);
+    }
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -3646,6 +3686,22 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    if (spec->adapt_min > 0.0f) {
+        int n_drafting = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            spec->adapt_drafted[seq_id] = false;
+            if (dp.drafting && spec->adapt_left[seq_id] > 0) {
+                spec->adapt_left[seq_id]--;
+                dp.drafting = false;
+            }
+            n_drafting += dp.drafting ? 1 : 0;
+        }
+        if (n_drafting == 0) {
+            return;
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3687,6 +3743,9 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    if (spec->adapt_min > 0.0f) {
+                        spec->adapt_drafted[seq_id] = true;
+                    }
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -3715,6 +3774,17 @@ void common_speculative_draft(common_speculative * spec) {
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    if (spec->adapt_min > 0.0f && seq_id >= 0 && (size_t) seq_id < spec->adapt_ema.size() && spec->adapt_drafted[seq_id]) {
+        spec->adapt_drafted[seq_id] = false;
+        float & ema = spec->adapt_ema[seq_id];
+        ema = 0.7f*ema + 0.3f*n_accepted;
+        if (ema < spec->adapt_min) {
+            spec->adapt_left[seq_id] = spec->adapt_skip;
+            // the probe after the pause starts at the threshold, one good draft resumes drafting
+            ema = spec->adapt_min;
+        }
+    }
 
     if (impl == nullptr) {
         GGML_ASSERT(n_accepted == 0);
