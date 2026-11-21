@@ -5354,6 +5354,35 @@ struct ggml_tensor * ggml_inkling_mix(
     return result;
 }
 
+struct ggml_tensor * ggml_inkling_sconv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * dyn) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(w) && w->ne[1] == x->ne[1]);
+
+    const int64_t n_conv = w->ne[0];
+    const int64_t n_t    = x->ne[0] - (n_conv - 1);
+    const int64_t n_s    = x->ne[2];
+    GGML_ASSERT(n_t >= 1);
+    if (dyn) {
+        GGML_ASSERT(dyn->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(dyn));
+        GGML_ASSERT(dyn->ne[0] % n_conv == 0 && x->ne[1] % (dyn->ne[0]/n_conv) == 0 && dyn->ne[1] == n_t*n_s);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[1], n_t, n_s);
+
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_SCONV);
+
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = dyn;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_inkling_control(
         struct ggml_context * ctx,
         struct ggml_tensor  * cur,

@@ -2289,6 +2289,7 @@ extern "C" {
         GGML_INKLING_CLIP    = 0, // x = a*scale; x*clamp(t/(|x| + 1e-6), 0, 1) per row
         GGML_INKLING_MIX     = 1, // softmax over the rms-normed states with learned queries, weighted sum
         GGML_INKLING_CONTROL = 2, // h = D [rms(cur); rms(msg)] (normed separately); (1 - tanh(F h))*cur + tanh(G h)*msg
+        GGML_INKLING_SCONV   = 3, // causal short conv with residual and optional per-head dynamic taps
     };
 
     // a: F32 [ne0, ne1, ne2, ne3] contiguous, scale: NULL or F32 broadcastable to a, the norm is over ne0
@@ -2314,6 +2315,15 @@ extern "C" {
             struct ggml_tensor  * down,
             struct ggml_tensor  * gain,
             struct ggml_tensor  * forget);
+
+    // x: F32 [n_conv - 1 + n_t, C, n_s] (history then inputs, time contiguous), w: F32 [n_conv, C]
+    // dyn: NULL or F32 [n_conv*n_head, n_t*n_s] per-head taps, tap l reads x at lag l
+    // result: F32 [C, n_t, n_s] = (x_t + conv(x, w) + dyn taps)/sqrt((dyn ? 2 : 1)*n_conv + 1)
+    GGML_API struct ggml_tensor * ggml_inkling_sconv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * dyn);
 
     // relative-position bias, evaluated inside the kernel instead of a per-head mask:
     //   d = qpos[iq1] - kpos[ik1];  s += table[d, h, iq1, iq3]  if 0 <= d < extent

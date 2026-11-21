@@ -318,6 +318,63 @@ static void inkling_control(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// SCONV: one thread per (channel, token)
+
+template <int n_conv>
+static __global__ void inkling_sconv_kernel(
+        const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ dyn, float * __restrict__ dst,
+        const int C, const int n_t, const int64_t xs1, const int64_t xs2, const int64_t dys1, const int n_head,
+        const int64_t os1, const int64_t os2, const float scale) {
+    const int c  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int ir = blockIdx.y;
+    if (c >= C) {
+        return;
+    }
+    const int t = ir % n_t;
+    const int s = ir / n_t;
+
+    const float * xc = x + c*xs1 + s*xs2 + t;
+    float xv[n_conv];
+#pragma unroll
+    for (int l = 0; l < n_conv; ++l) {
+        xv[l] = xc[l];
+    }
+    float acc = xv[n_conv - 1];
+#pragma unroll
+    for (int l = 0; l < n_conv; ++l) {
+        acc += xv[l]*w[c*n_conv + l];
+    }
+    if (dyn) {
+        const float * tap = dyn + ir*dys1 + (c / (C/n_head))*n_conv;
+#pragma unroll
+        for (int lag = 0; lag < n_conv; ++lag) {
+            acc += xv[n_conv - 1 - lag]*tap[lag];
+        }
+    }
+    dst[s*os2 + t*os1 + c] = acc*scale;
+}
+
+static void inkling_sconv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * w   = dst->src[1];
+    const ggml_tensor * dyn = dst->src[2];
+
+    const int n_conv = w->ne[0];
+    const int C      = x->ne[1];
+    const int n_t    = dst->ne[1];
+    const int n_s    = dst->ne[2];
+    const int n_head = dyn ? dyn->ne[0]/n_conv : 1;
+    const float scale = 1.0f/sqrtf(float((dyn ? 2 : 1)*n_conv + 1));
+
+    GGML_ASSERT(n_conv == 4);
+    const dim3 grid((C + 255)/256, n_t*n_s, 1);
+    inkling_sconv_kernel<4><<<grid, dim3(256, 1, 1), 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) w->data, dyn ? (const float *) dyn->data : nullptr, (float *) dst->data,
+        C, n_t, x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), dyn ? dyn->nb[1]/sizeof(float) : 0, n_head,
+        dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), scale);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_inkling_supported(const ggml_tensor * dst) {
     switch ((ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
@@ -327,6 +384,8 @@ bool ggml_cuda_inkling_supported(const ggml_tensor * dst) {
             return dst->src[0]->ne[1] >= 1 && dst->src[0]->ne[1] <= INKLING_MIX_MAX_QUERIES;
         case GGML_INKLING_CONTROL:
             return true;
+        case GGML_INKLING_SCONV:
+            return dst->src[1]->ne[0] == 4;
     }
     return false;
 }
@@ -336,6 +395,7 @@ void ggml_cuda_op_inkling(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_INKLING_CLIP:    inkling_clip(ctx, dst);    break;
         case GGML_INKLING_MIX:     inkling_mix(ctx, dst);     break;
         case GGML_INKLING_CONTROL: inkling_control(ctx, dst); break;
+        case GGML_INKLING_SCONV:   inkling_sconv(ctx, dst);   break;
         default: GGML_ABORT("unknown inkling op");
     }
 }

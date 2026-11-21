@@ -9410,6 +9410,32 @@ struct test_inkling_mix : public test_case {
     }
 };
 
+struct test_inkling_sconv : public test_case {
+    const int64_t C;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int64_t n_head; // 0: no dynamic taps
+
+    std::string vars() override {
+        return VARS_TO_STR4(C, n_t, n_s, n_head);
+    }
+
+    test_inkling_sconv(int64_t C = 1024, int64_t n_t = 5, int64_t n_s = 1, int64_t n_head = 8)
+        : C(C), n_t(n_t), n_s(n_s), n_head(n_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // x is the concat of the history and the transposed inputs, built the same way here
+        ggml_tensor * past = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, n_s);
+        ggml_tensor * cur  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
+        ggml_tensor * x    = ggml_concat(ctx, past, ggml_transpose(ctx, cur), 0);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_tensor * dyn  = n_head ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*n_head, n_t*n_s) : nullptr;
+        ggml_tensor * out  = ggml_inkling_sconv(ctx, x, w, dyn);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_inkling_control : public test_case {
     const int64_t n_embd;
     const int64_t n_rank;
@@ -13518,6 +13544,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_inkling_control(2304, 64, nt));
+        test_cases.emplace_back(new test_inkling_sconv(1024, nt, 1, 8));
+        test_cases.emplace_back(new test_inkling_sconv(2304, nt, 1, 0));
+        test_cases.emplace_back(new test_inkling_sconv(1024, nt, 2, 0));
     }
 
     // relative-position bias in the flash attention kernels (Inkling 2)

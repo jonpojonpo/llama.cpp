@@ -218,7 +218,10 @@ struct train_context {
 
     // add new rows into existing tensor in v_diff_tmp
     void concat_diff_tmp(const std::vector<struct ggml_tensor *> & diff_filtered) {
-        GGML_ASSERT((int) diff_filtered.size() == n_layers - 1);
+        if ((int) diff_filtered.size() != n_layers - 1) {
+            fprintf(stderr, "cvector: got %zu l_out layers, expected %d\n", diff_filtered.size(), n_layers - 1);
+        }
+        GGML_ASSERT((int) diff_filtered.size() >= n_layers - 1); // inkling2 also reports the final layer; extra ones are ignored
         for (int il = 0; il < n_layers - 1; il++) {
             auto t = diff_filtered[il];
             auto & diff_tmp = v_diff_tmp[il];

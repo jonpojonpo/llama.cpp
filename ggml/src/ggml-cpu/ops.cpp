@@ -2307,6 +2307,38 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
                 }
             }
         } break;
+        case GGML_INKLING_SCONV: {
+            const ggml_tensor * x   = dst->src[0];
+            const ggml_tensor * w   = dst->src[1];
+            const ggml_tensor * dyn = dst->src[2];
+            const int64_t n_conv = w->ne[0];
+            const int64_t C      = x->ne[1];
+            const int64_t n_t    = dst->ne[1];
+            const int64_t n_s    = dst->ne[2];
+            const int64_t n_head = dyn ? dyn->ne[0]/n_conv : 1;
+            const float   scale  = 1.0f/sqrtf(float((dyn ? 2 : 1)*n_conv + 1));
+            for (int64_t ir = ith; ir < n_t*n_s; ir += nth) {
+                const int64_t t = ir % n_t;
+                const int64_t s = ir / n_t;
+                const float * tap = dyn ? (const float *) ((const char *) dyn->data + ir*dyn->nb[1]) : nullptr;
+                float * out = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
+                for (int64_t c = 0; c < C; ++c) {
+                    const float * xc = (const float *) ((const char *) x->data + c*x->nb[1] + s*x->nb[2]) + t;
+                    const float * wc = (const float *) w->data + c*n_conv;
+                    float acc = xc[n_conv - 1];
+                    for (int64_t l = 0; l < n_conv; ++l) {
+                        acc += xc[l]*wc[l];
+                    }
+                    if (tap) {
+                        const int64_t h = c / (C/n_head);
+                        for (int64_t lag = 0; lag < n_conv; ++lag) {
+                            acc += xc[n_conv - 1 - lag]*tap[h*n_conv + lag];
+                        }
+                    }
+                    out[c] = acc*scale;
+                }
+            }
+        } break;
         default:
             GGML_ABORT("unknown inkling op");
     }

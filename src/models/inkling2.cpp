@@ -291,6 +291,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
+    if (inkling_fused()) {
+        return ggml_reshape_2d(ctx0, ggml_inkling_sconv(ctx0, x, weight, dynamic), n_channels, n_tokens);
+    }
+
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 
